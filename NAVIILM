@@ -1,0 +1,752 @@
+# Install required packages (run once)
+!pip install --quiet gradio rapidfuzz gTTS pydub sentence-transformers scikit-learn networkx
+# Note: sentence-transformers will download model weights on first run (internet)
+
+
+
+from google.colab import files
+uploaded = files.upload()
+
+
+
+# Load the dataset from the environment path you uploaded
+import json, os
+DATA_PATH = '/content/bigdata.json'   # <-- your uploaded file path
+print("Using dataset path:", DATA_PATH)
+if not os.path.exists(DATA_PATH):
+    # If not found, Colab will prompt upload
+    try:
+        from google.colab import files
+        print('bigdata.json not found at', DATA_PATH, ' — please upload it now.')
+        uploaded = files.upload()
+        for fn in uploaded:
+            open('/content/bigdata.json' + fn, 'wb').write(uploaded[fn])
+            print('Uploaded', fn)
+    except Exception as e:
+        raise RuntimeError("Dataset not found and upload failed.") from e
+
+with open(DATA_PATH, 'r', encoding='utf-8') as f:
+    raw = json.load(f)
+
+# Many uploaded datasets use top-level key "CampusData" — handle both cases
+if isinstance(raw, dict) and 'CampusData' in raw:
+    campus = raw['CampusData']
+else:
+    campus = raw
+
+print("Loaded campus. Blocks found:", list(campus.keys())[:20])
+# quick peek:
+import pprint
+first_block = next(iter(campus))
+pprint.pprint({first_block: campus[first_block]})
+
+
+
+
+
+# Build a flat 'entries' list from blocks and their rooms/places
+from rapidfuzz import process, fuzz
+entries = []            # each entry: {id,name,type,location,desc,raw,block}
+coord_map = {}          # id -> (x,y) if coordinates exist
+
+def add_entry(block_name, item):
+    eid = item.get('RoomID') or item.get('PlaceID') or item.get('Name') or item.get('id') or None
+    if not eid:
+        # make best-effort id
+        eid = item.get('Name') or item.get('RoomID') or f"{block_name}_unknown_{len(entries)}"
+    name = item.get('Name') or eid
+    typ = item.get('Type') or item.get('Category') or ''
+    loc = item.get('Location') or item.get('Floor') or ''
+    desc = item.get('Description') or item.get('Keywords') or item.get('Note') or ''
+    # search terms: include any helpful fields
+    search_terms = []
+    for k in ('search_keywords','search_terms','keywords'):
+        if k in item:
+            v = item[k]
+            if isinstance(v, list):
+                search_terms.extend(v)
+            elif isinstance(v, str):
+                search_terms.append(v)
+    raw = ' '.join([str(v) for v in [eid, name, typ, loc, desc] + search_terms if v])
+    entries.append({'id':eid, 'name':name, 'type':typ, 'location':loc, 'desc':desc, 'raw':raw, 'block':block_name})
+    # look for coordinates in common fields
+    for k in ('coordinates','coord','position','xy','location_coords'):
+        if k in item:
+            try:
+                c = item[k]
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    x, y = float(c[0]), float(c[1])
+                    coord_map[eid] = (x, y)
+            except Exception:
+                pass
+
+# iterate dataset
+for block_name, block_value in campus.items():
+    # if block contains a list of rooms under 'rooms', 'places', etc.
+    for key in ('rooms','places','locations','items','rooms_list'):
+        if isinstance(block_value, dict) and key in block_value and isinstance(block_value[key], list):
+            for item in block_value[key]:
+                add_entry(block_name, item)
+    # sometimes rooms are top-level list directly
+    if isinstance(block_value, list):
+        for item in block_value:
+            add_entry(block_name, item)
+    # also add block as an entry (helps queries like "Engineering block")
+    add_entry(block_name, {'Name': block_name, 'Type': 'Block', 'Description': block_value.get('description') if isinstance(block_value, dict) else ''})
+
+print("Built index with", len(entries), "entries.")
+print("Coordinates available for", len(coord_map), "entries.")
+# show a sample
+entries[:3]
+
+
+
+
+
+# Fuzzy search helper using RapidFuzz
+from rapidfuzz import process, fuzz
+
+def fuzzy_search(query, topk=5, score_cutoff=50):
+    choices = {i: e['raw'] for i,e in enumerate(entries)}
+    results_raw = process.extract(query, choices, scorer=fuzz.WRatio, limit=topk)
+    results = []
+    for match_str, score, idx in results_raw:
+        if score >= score_cutoff:
+            e = entries[idx]
+            results.append({'score': score, 'id': e['id'], 'name': e['name'], 'type': e['type'], 'location': e['location'], 'desc': e['desc'], 'block': e['block']})
+    return results
+
+# quick test
+print("Fuzzy test for 'library':", fuzzy_search('library', topk=5))
+
+
+
+
+
+# Semantic search using sentence-transformers
+# This cell may download model weights on first run
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+print("Loading sentence-transformers model (all-MiniLM-L6-v2)...")
+sbert_model = SentenceTransformer('all-MiniLM-L6-v2')  # small & fast
+texts = [e['raw'] for e in entries]
+embeddings = sbert_model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+# normalize embeddings for cosine similarity
+norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+embeddings = embeddings / (norms + 1e-9)
+print("Embeddings ready. Shape:", embeddings.shape)
+
+from sklearn.metrics.pairwise import cosine_similarity
+def semantic_search(query, topk=5):
+    q_emb = sbert_model.encode([query], convert_to_numpy=True)
+    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
+    sims = cosine_similarity(q_emb, embeddings)[0]
+    idxs = list(np.argsort(-sims)[:topk])
+    results = []
+    for i in idxs:
+        results.append({'score': float(sims[i])*100, 'id': entries[i]['id'], 'name': entries[i]['name'], 'type': entries[i]['type'], 'location': entries[i]['location'], 'desc': entries[i]['desc'], 'block': entries[i]['block']})
+    return results
+
+# quick test
+print("Semantic test for 'library':", semantic_search('library', topk=5))
+
+
+
+
+# Build a simple undirected graph between coordinate nodes (k-nearest neighbors)
+import networkx as nx, math
+
+G = nx.Graph()
+for eid, (x,y) in coord_map.items():
+    G.add_node(eid, pos=(x,y))
+
+nodes = list(G.nodes())
+for i in range(len(nodes)):
+    xi, yi = G.nodes[nodes[i]]['pos']
+    # compute distances to others and connect to nearest N neighbors
+    dists = []
+    for j in range(len(nodes)):
+        if i == j: continue
+        xj, yj = G.nodes[nodes[j]]['pos']
+        d = math.hypot(xi-xj, yi-yj)
+        dists.append((d, nodes[j]))
+    dists.sort()
+    # connect to up to 6 nearest neighbors (tune as needed)
+    for d, nb in dists[:6]:
+        if not G.has_edge(nodes[i], nb):
+            G.add_edge(nodes[i], nb, weight=d)
+
+print("Graph built: nodes=", G.number_of_nodes(), "edges=", G.number_of_edges())
+
+# A* routing helper
+def euclidean(a, b):
+    x1,y1 = G.nodes[a]['pos']
+    x2,y2 = G.nodes[b]['pos']
+    return math.hypot(x1-x2, y1-y2)
+
+def shortest_path_a_star(start_id, goal_id):
+    if start_id not in G or goal_id not in G:
+        return None
+    try:
+        path = nx.astar_path(G, start_id, goal_id, heuristic=euclidean, weight='weight')
+        length = nx.path_weight(G, path, weight='weight')
+        return {'path': path, 'length': length}
+    except Exception as e:
+        # disconnected or other failure
+        return None
+
+# Example (only works if both ids have coords)
+# print(shortest_path_a_star('RoomA', 'RoomB'))
+
+
+
+
+
+
+
+# Assistant response logic that picks search mode and optionally computes route
+import random
+
+def witty_reply():
+    return random.choice([
+        "I'm NAVIILM — your campus compass with jokes.",
+        "Maps, coffee, and Wi-Fi — I know where they hide.",
+        "Lost? Don't worry. I will not tell your professor."
+    ])
+
+def assistant_response(user_text, search_mode='semantic', from_location=None, want_route=False):
+    q = user_text.strip()
+    # choose search
+    if search_mode == 'semantic':
+        results = semantic_search(q, topk=6)
+    else:
+        results = fuzzy_search(q, topk=6)
+
+    if not results:
+        return witty_reply() + " — I couldn't find that. Try another name or check spelling."
+
+    top = results[0]
+    lines = []
+    lines.append(witty_reply())
+    lines.append(f"Top match: **{top['name']}** ({top['type']}) — Block: {top['block']} — score {top['score']:.1f}%")
+    lines.append(f"Location/floor: {top['location']}")
+    lines.append(f"Description: {top['desc'] or 'No description available.'}")
+
+    # show coordinates if available
+    if top['id'] in coord_map:
+        x,y = coord_map[top['id']]
+        lines.append(f"Coordinates: ({x:.2f}, {y:.2f})")
+
+        if want_route and from_location:
+            # find start id by searching from_location
+            start_candidates = (semantic_search(from_location, topk=1) if search_mode=='semantic' else fuzzy_search(from_location, topk=1))
+            if start_candidates and start_candidates[0]['id'] in coord_map:
+                start_id = start_candidates[0]['id']
+                route = shortest_path_a_star(start_id, top['id'])
+                if route:
+                    lines.append(f"Route from **{start_candidates[0]['name']}** to **{top['name']}** — distance {route['length']:.2f}")
+                    # optionally show node names
+                    lines.append("Steps: " + " -> ".join(route['path']))
+                else:
+                    lines.append("Could not compute route (graph may be disconnected).")
+            else:
+                lines.append("Could not find coordinates for your starting location. Provide a starting place with coordinates.")
+    else:
+        lines.append("No coordinates available for this place. Add `\"coordinates\": [x,y]` to enable routing.")
+
+    # alternatives
+    if len(results) > 1:
+        lines.append("\nOther matches:")
+        for r in results[1:4]:
+            lines.append(f"- {r['name']} ({r['type']}) — Block: {r['block']} — score {r['score']:.1f}%")
+    return "\n".join(lines)
+
+# quick local test
+print(assistant_response("library", search_mode='semantic'))
+
+
+
+
+
+
+# Cell 9 (fixed) — gTTS helper: returns a filepath suitable for Gradio Audio(type='filepath')
+from gtts import gTTS
+import tempfile, os, uuid
+
+def tts_audio_filepath(text, lang='en'):
+    """
+    Create a temporary mp3 file and return its path.
+    Caller (Gradio) will read it from this path.
+    We don't immediately delete the file because Gradio needs it to exist while serving.
+    You can periodically clean /tmp or later add cleanup logic if desired.
+    """
+    # use a unique filename so concurrent requests don't collide
+    tmp_dir = tempfile.gettempdir()
+    fname = f"naviilm_tts_{uuid.uuid4().hex}.mp3"
+    fpath = os.path.join(tmp_dir, fname)
+    gTTS(text=text, lang=lang).save(fpath)
+    return fpath
+
+# quick manual test (uncomment to run):
+# path = tts_audio_filepath("Hello from NAVIILM. This is a voice test.")
+# print("Audio written to:", path)
+# from IPython.display import Audio, display
+# display(Audio(path, autoplay=False))
+
+
+
+
+
+
+
+
+
+
+
+
+# ====== Replacement cell: Better voice control (concise vs detailed) ======
+# Paste & run this cell in Colab AFTER you've run the earlier setup cells
+# (indexing, semantic/fuzzy functions, TTS helper, embeddings, etc.)
+
+import random
+from typing import Tuple
+
+# New assistant that returns both display text and a speakable short text
+def assistant_response_for_ui(user_text: str,
+                              search_mode: str = 'semantic',
+                              from_location: str | None = None,
+                              want_route: bool = False,
+                              voice_verbosity: str = 'concise'  # 'concise' or 'detailed'
+                             ) -> Tuple[str, str]:
+    """
+    Returns (display_text, speak_text)
+    - display_text: full textual response (shown on screen)
+    - speak_text: short/concise text to send to TTS according to voice_verbosity
+    """
+    q = user_text.strip()
+    # use existing search helpers
+    results = semantic_search(q, topk=6) if search_mode == 'semantic' else fuzzy_search(q, topk=6)
+    if not results:
+        display = "Sorry — I couldn't find that place. Try another name or spelling."
+        speak = "I couldn't find that place. Try another name."
+        return display, speak
+
+    top = results[0]
+    # Build display (full) text
+    lines = []
+    lines.append(random.choice([
+        "I'm NAVIILM — your campus guide (text & voice).",
+        "Yeh raha tumhara campus helper!",
+        "NAVIILM bol raha hai — details neeche dekh lo."
+    ]))
+    lines.append(f"**Top match:** {top['name']} ({top['type'] or 'N/A'}) — Block: {top['block']} — score {top['score']:.1f}%")
+    lines.append(f"Location / Floor: {top['location'] or 'N/A'}")
+    lines.append(f"Description: {top['desc'] or 'No description available.'}")
+
+    # Coordinates + routing info (if requested)
+    if top['id'] in coord_map:
+        x, y = coord_map[top['id']]
+        lines.append(f"Coordinates: ({x:.2f}, {y:.2f})")
+        if want_route and from_location:
+            # find start
+            start_candidates = (semantic_search(from_location, topk=1) if search_mode=='semantic' else fuzzy_search(from_location, topk=1))
+            if start_candidates and start_candidates[0]['id'] in coord_map:
+                start_id = start_candidates[0]['id']
+                route = shortest_path_a_star(start_id, top['id'])
+                if route:
+                    lines.append(f"Route from {start_candidates[0]['name']} → {top['name']}: distance {route['length']:.2f}")
+                    lines.append("Steps: " + " -> ".join(route['path']))
+                else:
+                    lines.append("Could not compute route (graph disconnected).")
+            else:
+                lines.append("Starting location doesn't have coordinates; cannot compute route.")
+    else:
+        lines.append('No coordinates for this place. Add "coordinates": [x,y] in dataset to enable routing.')
+
+    # Add other matches in display (but not required for voice)
+    if len(results) > 1:
+        lines.append("\n**Other matches:**")
+        for r in results[1:4]:
+            lines.append(f"- {r['name']} ({r['type'] or 'N/A'}) — Block: {r['block']} — score {r['score']:.1f}%")
+
+    display_text = "\n".join(lines)
+
+    # Build speak_text according to voice_verbosity
+    # concise: only top name, type, block, floor; NO percentages, NO other matches
+    # detailed: include percentages and a short list of other matches
+    if voice_verbosity == 'concise':
+        speak_parts = [f"{top['name']} in {top['block']}."]
+        if top['location']:
+            speak_parts.append(f"Located on {top['location']}.")
+        if top['desc']:
+            # keep description short (max ~100 chars)
+            short_desc = (top['desc'] if isinstance(top['desc'], str) else " ".join(top['desc']))[:100]
+            if short_desc:
+                speak_parts.append(short_desc)
+        speak_text = " ".join(speak_parts)
+    else:
+        # detailed voice: include score and up to 2 alternatives
+        speak_parts = [f"Top match {top['name']}. Type: {top['type'] or 'N A'}. Block: {top['block']}. Score {int(round(top['score']))} percent."]
+        if top['location']:
+            speak_parts.append(f"Floor: {top['location']}.")
+        if top['desc']:
+            short_desc = (top['desc'] if isinstance(top['desc'], str) else " ".join(top['desc']))[:120]
+            if short_desc:
+                speak_parts.append(short_desc)
+        # alternatives
+        alt_cnt = min(2, max(0, len(results)-1))
+        if alt_cnt > 0:
+            alt_texts = []
+            for r in results[1:1+alt_cnt]:
+                alt_texts.append(f"{r['name']} ({int(round(r['score']))} percent)")
+            speak_parts.append("Other matches: " + ", ".join(alt_texts) + ".")
+        speak_text = " ".join(speak_parts)
+
+    # final safety: keep speak_text short (<= 350 chars) to avoid overly long TTS
+    if len(speak_text) > 350:
+        speak_text = speak_text[:347] + "."
+
+    return display_text, speak_text
+
+
+# Replace the gradio callback to use the new assistant_response_for_ui and new voice verbosity control
+import gradio as gr
+
+def gradio_fn_improved(user_input, mode, voice_verbosity, speak_flag, from_loc, do_route):
+    display_text, speak_text = assistant_response_for_ui(
+        user_input,
+        search_mode=mode,
+        from_location=from_loc,
+        want_route=do_route,
+        voice_verbosity=voice_verbosity
+    )
+    audio_path = None
+    if speak_flag:
+        # use existing tts_audio_filepath helper to create mp3 for the speak_text
+        audio_path = tts_audio_filepath(speak_text)
+    return display_text, (audio_path if audio_path else None)
+
+# Build a fresh demo UI (or you can update your existing demo)
+with gr.Blocks() as improved_demo:
+    gr.Markdown("## NAVIILM — Improved Voice (Concise by default)\n(Voice will speak only top result unless you choose 'detailed'.)")
+    with gr.Row():
+        txt = gr.Textbox(lines=2, placeholder='Ask: Where is the library? Or "Locate Box Cafe"', label='Your question')
+    with gr.Row():
+        mode = gr.Radio(['semantic','fuzzy'], value='semantic', label='Search mode')
+        voice_verbosity = gr.Radio(['concise','detailed'], value='concise', label='Voice verbosity')
+        speak = gr.Checkbox(label='Play voice answer', value=False)
+    from_loc = gr.Textbox(lines=1, placeholder='Optional: starting location (for routing)', label='Start location (optional)')
+    do_route = gr.Checkbox(label='Compute route (requires coordinates)', value=False)
+    out_text = gr.Markdown()
+    out_audio = gr.Audio(type='filepath', label='Voice answer (mp3 file)')
+    submit = gr.Button('Ask NAVIILM (improved)')
+    submit.click(fn=gradio_fn_improved, inputs=[txt, mode, voice_verbosity, speak, from_loc, do_route], outputs=[out_text, out_audio])
+
+# Launch note: if you already have an app running, stop it and run improved_demo.launch(share=True)
+print("Cell ready. Now run: improved_demo.launch(share=True) to open the improved UI.")
+
+
+
+
+
+
+
+# NAVIILM Quick Diagnostic Cell
+import os, sys, traceback, json, tempfile
+print("=== NAVIILM Diagnostic ===")
+DATA_PATH = "/content/bigdata.json"
+print("Dataset path:", DATA_PATH)
+print("Exists:", os.path.exists(DATA_PATH))
+if os.path.exists(DATA_PATH):
+    print("Size (bytes):", os.path.getsize(DATA_PATH))
+    try:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            small = f.read(1000)
+        print("Preview (first 1000 chars):")
+        print(small[:1000])
+    except Exception as e:
+        print("Could not preview file:", e)
+
+# Helper to test a symbol exists
+def has(name):
+    return name in globals() or name in locals()
+
+symbols = [
+    'entries', 'coord_map', 'fuzzy_search', 'semantic_search',
+    'assistant_response', 'tts_audio_filepath', 'tts_audio_bytes',
+    'G', 'shortest_path_a_star', 'sbert_model'
+]
+print("\nSymbols presence:")
+for s in symbols:
+    print(f" - {s}: {'YES' if has(s) else 'NO'}")
+
+# Test entries
+try:
+    if has('entries'):
+        print("\nNumber of indexed entries:", len(entries))
+        print("Sample entry[0]:")
+        import pprint
+        pprint.pprint(entries[0])
+    else:
+        print("\nIndex 'entries' not found. Run the index-building cell (Cell 4).")
+except Exception as e:
+    print("Error inspecting entries:", e)
+    traceback.print_exc(limit=1)
+
+# Test fuzzy search (if available)
+try:
+    if has('fuzzy_search'):
+        print("\nRunning fuzzy_search('library') ...")
+        print(fuzzy_search('library', topk=5))
+    else:
+        print("\nFuzzy search function missing. Run the fuzzy search cell (Cell 5).")
+except Exception as e:
+    print("fuzzy_search raised an error:", e)
+    traceback.print_exc(limit=1)
+
+# Test semantic search (if available)
+try:
+    if has('semantic_search'):
+        print("\nRunning semantic_search('library') ... (this requires sbert_model & embeddings)")
+        print(semantic_search('library', topk=5))
+    else:
+        print("\nSemantic search missing. Run the sentence-transformers cell (Cell 6).")
+except Exception as e:
+    print("semantic_search raised an error:", e)
+    traceback.print_exc(limit=1)
+
+# Test assistant_response
+try:
+    if has('assistant_response'):
+        print("\nAssistant test: assistant_response('Where is the library?', search_mode='semantic')\n")
+        out = assistant_response("Where is the library?", search_mode='semantic')
+        print(out)
+    else:
+        print("\nassistant_response not defined. Run the assistant logic cell (Cell 8).")
+except Exception as e:
+    print("assistant_response raised an error:", e)
+    traceback.print_exc(limit=1)
+
+# Test TTS helper (writes a small temp file) for the fixed filepath version
+try:
+    if has('tts_audio_filepath'):
+        print("\nTesting tts_audio_filepath(...) — writing temp MP3")
+        p = tts_audio_filepath("NAV IILM test audio.")
+        print("Wrote TTS file to:", p, "Exists:", os.path.exists(p), "Size:", os.path.getsize(p) if os.path.exists(p) else 'n/a')
+    elif has('tts_audio_bytes'):
+        print("\nFound tts_audio_bytes — generating bytes")
+        b = tts_audio_bytes("NAV IILM test audio.")
+        print("Generated bytes length:", len(b))
+    else:
+        print("\nNo TTS helpers found. Run the fixed TTS cell (Cell 9).")
+except Exception as e:
+    print("TTS helper raised an error:", e)
+    traceback.print_exc(limit=1)
+
+# Test routing (if graph exists and has >=2 nodes)
+try:
+    if has('G') and hasattr(G, 'number_of_nodes'):
+        print("\nRouting graph nodes:", G.number_of_nodes(), "edges:", G.number_of_edges())
+        if G.number_of_nodes() >= 2 and has('shortest_path_a_star'):
+            nodes = list(G.nodes())[:2]
+            print("Attempting route between", nodes[0], "and", nodes[1])
+            r = shortest_path_a_star(nodes[0], nodes[1])
+            print("Route result:", r)
+        else:
+            print("Routing graph exists but not enough nodes or shortest_path_a_star missing.")
+    else:
+        print("\nRouting graph 'G' not found. Run the routing graph cell (Cell 7) after adding coordinates.")
+except Exception as e:
+    print("Routing check error:", e)
+    traceback.print_exc(limit=1)
+
+# Check Gradio presence and version
+try:
+    import gradio as gr
+    print("\nGradio version:", gr.__version__)
+except Exception as e:
+    print("\nGradio not available or import failed:", e)
+
+print("\n=== Diagnostic complete ===")
+print("If something printed 'NO' or you saw tracebacks, re-run the corresponding cells above the Gradio UI one-by-one, then run this diagnostic again.")
+print("File used in this diagnostic: file:/content/bigdata.json")
+
+
+
+
+
+
+
+# ===== NAVIILM: Bilingual (Hindi + English) output + recommendations =====
+# Requires: gTTS, pydub installed and ffmpeg present.
+# Uses existing helpers: semantic_search / fuzzy_search, coord_map, shortest_path_a_star, tts_audio_filepath (or will create tts_audio_filepath if missing)
+DATA_FILE_URL = "file:///content/bigdata.json"
+
+from gtts import gTTS
+from pydub import AudioSegment
+import tempfile, os, uuid
+import gradio as gr
+import random
+
+# fallback tts helper if not present
+def tts_audio_filepath(text, lang='en'):
+    tmp_dir = tempfile.gettempdir()
+    fname = f"naviilm_tts_{uuid.uuid4().hex}_{lang}.mp3"
+    fpath = os.path.join(tmp_dir, fname)
+    gTTS(text=text, lang=lang).save(fpath)
+    return fpath
+
+def tts_bilingual_concat(text_hi: str, text_en: str) -> str:
+    """
+    Create two TTS files (Hindi & English), concatenate them into one mp3,
+    and return the filepath to the combined clip.
+    """
+    try:
+        hi_path = tts_audio_filepath(text_hi, lang='hi')
+        en_path = tts_audio_filepath(text_en, lang='en')
+        # load and concatenate
+        hi_seg = AudioSegment.from_file(hi_path)
+        en_seg = AudioSegment.from_file(en_path)
+        combined = hi_seg + AudioSegment.silent(duration=250) + en_seg  # small pause
+        out_path = os.path.join(tempfile.gettempdir(), f"naviilm_bi_{uuid.uuid4().hex}.mp3")
+        combined.export(out_path, format="mp3")
+        # cleanup the intermediate files
+        try:
+            os.remove(hi_path)
+            os.remove(en_path)
+        except:
+            pass
+        return out_path
+    except Exception as e:
+        # fallback: try single language
+        return tts_audio_filepath(text_en, lang='en')
+
+# A simple recommendation helper: given top result, return up to 3 related or nearby suggestions
+def make_recommendations(top_result, search_mode='semantic', topk=3):
+    # Strategy: find other high-scoring results by semantic search or fuzzy search (excluding top)
+    q = top_result['name']
+    results = semantic_search(q, topk=6) if search_mode=='semantic' else fuzzy_search(q, topk=6)
+    recs = []
+    for r in results:
+        if r['id'] != top_result['id']:
+            recs.append({'name': r['name'], 'type': r['type'], 'block': r['block']})
+        if len(recs) >= topk:
+            break
+    # If no semantic alternatives, fall back to simple popular suggestions (example)
+    if not recs:
+        recs = [{'name':'Cafeteria','type':'Food','block':'GeneralFacilities'},
+                {'name':'Admin Office','type':'Office','block':'IGSM_Block'}][:topk]
+    return recs
+
+# New assistant that returns bilingual speak text and concise display with recommendations
+def assistant_bilingual(user_text: str, search_mode='semantic', from_location=None, want_route=False, voice_style='concise'):
+    # pick results
+    results = semantic_search(user_text, topk=6) if search_mode=='semantic' else fuzzy_search(user_text, topk=6)
+    if not results:
+        display = "Sorry — I couldn't find that place. / माफ़ कीजिए — मैं वह स्थान नहीं ढूँढ पाया।"
+        speak_hi = "माफ़ कीजिए, मैं वह स्थान नहीं ढूँढ पाया।"
+        speak_en = "Sorry, I couldn't find that place."
+        audio = tts_bilingual_concat(speak_hi, speak_en)
+        return display, audio
+
+    top = results[0]
+    # concise display in bilingual form (mix): English primary, short Hindi line below
+    lines = []
+    lines.append(f"**{top['name']}** ({top['type'] or 'N/A'}) — Block: {top['block']}")
+    lines.append(f"Location / Floor: {top['location'] or 'N/A'}")
+    if top['desc']:
+        desc_text = top['desc'] if isinstance(top['desc'], str) else ' '.join(top['desc'])
+        lines.append(f"Description: {desc_text}")
+    # recommendations (show as user suggestions)
+    recs = make_recommendations(top, search_mode=search_mode, topk=3)
+    if recs:
+        lines.append("\n**You might also like / आप ये भी देख सकते हैं:**")
+        for r in recs:
+            lines.append(f"- {r['name']} ({r['type']}) — {r['block']}")
+
+    display_text = "\n".join(lines)
+
+    # Bilingual speech: build a short Hindi followed by English
+    # Hindi: concise natural sentence
+    hi_parts = []
+    hi_parts.append(f"{top['name']} {top['block']} में है।")
+    if top['location']:
+        hi_parts.append(f"{top['location']} पर मिलेगा।")
+    if want_route and from_location and top['id'] in coord_map:
+        hi_parts.append("यदि आप रास्ता चाहते हैं, तो बताइए।")
+    hi_text = " ".join(hi_parts)
+
+    # English: concise natural sentence
+    en_parts = []
+    en_parts.append(f"{top['name']} is in {top['block']}.")
+    if top['location']:
+        en_parts.append(f"It is located on {top['location']}.")
+    # recommendations short english line
+    if recs:
+        en_recs = ", ".join([r['name'] for r in recs[:2]])
+        en_parts.append(f"You may also check: {en_recs}.")
+    en_text = " ".join(en_parts)
+
+    # shorten if excessively long
+    if len(hi_text) > 250:
+        hi_text = hi_text[:247] + "."
+    if len(en_text) > 350:
+        en_text = en_text[:347] + "."
+
+    # produce combined audio (Hindi then English)
+    audio_path = tts_bilingual_concat(hi_text, en_text)
+    return display_text, audio_path
+
+# Gradio wrapper that accepts typed text or mic audio (mic transcription helper assumed to exist; if not, prefer typed text)
+def gradio_bilingual_fn(text_input, mic_audio, mode, voice_style, speak_flag, from_loc, do_route):
+    user_query = (text_input or "").strip()
+    # If mic provided, try to transcribe (use transcribe_audio_file if present)
+    if mic_audio:
+        audio_path = None
+        if isinstance(mic_audio, dict):
+            audio_path = mic_audio.get("name") or mic_audio.get("tmp_path") or mic_audio.get("data")
+        elif isinstance(mic_audio, str):
+            audio_path = mic_audio
+        else:
+            try:
+                audio_path = mic_audio.name
+            except:
+                audio_path = None
+        if audio_path and os.path.exists(audio_path):
+            # use transcribe_audio_file if available, else skip
+            try:
+                transcribed = transcribe_audio_file(audio_path)  # may be defined earlier in notebook
+            except:
+                transcribed = ""
+            if transcribed:
+                user_query = transcribed
+
+    if not user_query:
+        return "Please type or speak your question. / कृपया अपना प्रश्न टाइप करें या बोलें।", None
+
+    display, audio = assistant_bilingual(user_query, search_mode=mode, from_location=from_loc, want_route=do_route, voice_style=voice_style)
+    # if speak_flag is false, return no audio
+    if not speak_flag:
+        return display, None
+    return display, audio
+
+# Build the bilingual UI (mic + text)
+with gr.Blocks() as bilingual_demo:
+    gr.Markdown("## NAVIILM — Bilingual (हिंदी + English) — Suggestions enabled")
+    with gr.Row():
+        txt = gr.Textbox(lines=2, placeholder="Type here or use Microphone", label="Text input")
+    with gr.Row():
+        mic = gr.Microphone(type="filepath", label="🎤 Speak (Microphone)")
+    with gr.Row():
+        mode = gr.Radio(['semantic','fuzzy'], value='semantic', label='Search mode')
+        voice_style = gr.Radio(['concise','detailed'], value='concise', label='Voice style')
+        speak = gr.Checkbox(label='Play voice answer (Hindi + English)', value=True)
+    from_loc = gr.Textbox(lines=1, placeholder='Optional: starting location (for routing)', label='Start location (optional)')
+    do_route = gr.Checkbox(label='Compute route (requires coordinates)', value=False)
+    out_text = gr.Markdown()
+    out_audio = gr.Audio(type="filepath", label='Bilingual Voice (mp3)')
+    btn = gr.Button("Ask NAVIILM (Bilingual)")
+    btn.click(fn=gradio_bilingual_fn, inputs=[txt, mic, mode, voice_style, speak, from_loc, do_route], outputs=[out_text, out_audio])
+
+print("Ready. Run: bilingual_demo.launch(share=True) to open bilingual NAVIILM.")
